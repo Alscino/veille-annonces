@@ -1,0 +1,8 @@
+{
+  "query": "coffret collector Metroid Switch",
+  "price_min": 0,
+  "price_max": 300,
+  "include_keywords": ["metroid"],
+  "exclude_keywords": ["recherche", "cherche", "echange contre", "figurine seule", "sticker"],
+  "sites": ["Vinted", "Leboncoin", "eBay", "Rakuten", "Cdiscount"]
+}

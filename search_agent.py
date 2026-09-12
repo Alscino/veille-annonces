@@ -13,10 +13,9 @@ depuis n'importe quel appareil une fois publiée sur GitHub Pages.
   Il est normal que ces scrapers échouent de temps en temps (erreur 403).
   Regarde la section "État des sites" en bas de la page HTML générée :
   elle indique clairement quel site a répondu et lequel a été bloqué.
-- Les autres sites (eBay, Rakuten, Cdiscount) sont scrapés par lecture du
-  HTML de leur page de résultats de recherche. Si un site change sa mise
-  en page, le scraper correspondant peut ne plus rien trouver : dans ce
-  cas, ajuste les sélecteurs CSS dans la fonction scrape_xxx concernée.
+- Les autres sites (eBay, Rakuten, Cdiscount) sont scrapés via un
+  navigateur headless (Playwright) pour gérer le JavaScript et réduire
+  les blocages anti-robot.
 - Aucune clé API, aucun compte payant n'est nécessaire pour cette version.
 """
 
@@ -35,6 +34,7 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 from jinja2 import Template
+from playwright.sync_api import sync_playwright
 
 HEADERS = {
     "User-Agent": (
@@ -44,6 +44,83 @@ HEADERS = {
     "Accept-Language": "fr-FR,fr;q=0.9",
 }
 TIMEOUT = 15
+
+
+def fetch_rendered_html(url: str, wait_selector: str | None = None, timeout_ms: int = 20000) -> str:
+    """
+    Charge une page avec un vrai navigateur headless (Chromium) et attend
+    l'exécution du JavaScript, contrairement à requests.get() qui ne voit
+    que le HTML brut envoyé avant que la page ne se construise.
+    Nécessaire pour les sites modernes (Cdiscount, Fnac...) qui affichent
+    leurs résultats de recherche via JavaScript.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            locale="fr-FR",
+        )
+        page = context.new_page()
+        try:
+            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            if wait_selector:
+                try:
+                    page.wait_for_selector(wait_selector, timeout=8000)
+                except Exception:
+                    pass
+            else:
+                page.wait_for_timeout(2500)
+            html = page.content()
+        finally:
+            browser.close()
+    return html
+
+
+PRICE_RE = re.compile(r"(\d{1,4}(?:[.,]\d{2})?)\s?€")
+
+
+def extract_generic_listings(html: str, base_url: str, site: str, limit: int = 30) -> list["Listing"]:
+    """
+    Extraction 'de secours' quand on ne connaît pas les sélecteurs CSS exacts
+    d'un site : cherche tout lien qui contient à la fois une image et un prix
+    à proximité. Moins précis qu'un sélecteur dédié, mais résiste beaucoup
+    mieux aux changements de mise en page que des classes CSS figées.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+    seen_urls = set()
+    for a in soup.find_all("a", href=True):
+        if len(results) >= limit:
+            break
+        href = a.get("href", "")
+        if not href or href.startswith("#") or href.startswith("javascript"):
+            continue
+        block_text = a.get_text(" ", strip=True)
+        price_match = PRICE_RE.search(block_text)
+        if not price_match:
+            parent = a.find_parent()
+            if parent:
+                price_match = PRICE_RE.search(parent.get_text(" ", strip=True))
+        if not price_match:
+            continue
+        img = a.find("img")
+        title = (img.get("alt") if img and img.get("alt") else "").strip() or block_text[:120]
+        if not title:
+            continue
+        url = href if href.startswith("http") else base_url.rstrip("/") + "/" + href.lstrip("/")
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        price = None
+        try:
+            price = float(price_match.group(1).replace(",", "."))
+        except ValueError:
+            pass
+        thumb = ""
+        if img:
+            thumb = img.get("src") or img.get("data-src") or ""
+        results.append(Listing(site=site, title=title, price=price, location="", url=url, thumbnail=thumb))
+    return results
 
 
 @dataclass
@@ -159,13 +236,17 @@ def scrape_leboncoin(query: str, status: dict) -> list[Listing]:
 
 
 def scrape_ebay(query: str, status: dict) -> list[Listing]:
+    """
+    Utilise un navigateur headless plutôt que requests : eBay bloquait les
+    requêtes simples (403), probablement à cause de leur système anti-robot
+    qui détecte les clients qui ne se comportent pas comme un vrai navigateur.
+    """
     listings: list[Listing] = []
     try:
-        url = "https://www.ebay.fr/sch/i.html"
-        params = {"_nkw": query, "_sacat": 0}
-        r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        from urllib.parse import quote
+        url = f"https://www.ebay.fr/sch/i.html?_nkw={quote(query)}&_sacat=0"
+        html = fetch_rendered_html(url, wait_selector="li.s-item")
+        soup = BeautifulSoup(html, "lxml")
         for card in soup.select("li.s-item")[:30]:
             title_el = card.select_one(".s-item__title")
             price_el = card.select_one(".s-item__price")
@@ -193,13 +274,13 @@ def scrape_ebay(query: str, status: dict) -> list[Listing]:
 
 
 def scrape_rakuten(query: str, status: dict) -> list[Listing]:
+    """Navigateur headless pour la même raison que pour eBay (blocage 403 en requête simple)."""
     listings: list[Listing] = []
     try:
-        url = "https://fr.shopping.rakuten.com/search"
-        params = {"q": query}
-        r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        from urllib.parse import quote
+        url = f"https://fr.shopping.rakuten.com/search?q={quote(query)}"
+        html = fetch_rendered_html(url)
+        soup = BeautifulSoup(html, "lxml")
         cards = soup.select("[data-testid='product-card'], .product-card")[:30]
         for card in cards:
             title_el = card.select_one("h3, [data-testid='product-title']")
@@ -229,34 +310,20 @@ def scrape_rakuten(query: str, status: dict) -> list[Listing]:
 
 
 def scrape_cdiscount(query: str, status: dict) -> list[Listing]:
+    """
+    Cdiscount charge ses résultats de recherche en JavaScript après le
+    chargement initial de la page : un simple requests.get() ne voit qu'une
+    page vide. On utilise donc un navigateur headless (fetch_rendered_html),
+    puis une extraction générique par prix/image plutôt que des sélecteurs
+    CSS figés, dont on ne connaît pas la version exacte actuellement utilisée
+    par le site.
+    """
     listings: list[Listing] = []
     try:
         slug = query.replace(" ", "+")
         url = f"https://www.cdiscount.com/search/10/{slug}.html"
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
-        cards = soup.select(".prdtBILDetails, .lpBloc")[:30]
-        for card in cards:
-            title_el = card.select_one(".prdtBTit, a")
-            price_el = card.select_one(".price")
-            img_el = card.select_one("img")
-            if not title_el:
-                continue
-            price = None
-            if price_el:
-                m = re.search(r"[\d,.]+", price_el.get_text().replace("\xa0", ""))
-                if m:
-                    price = float(m.group().replace(",", "."))
-            href = title_el.get("href", "")
-            listings.append(Listing(
-                site="Cdiscount",
-                title=title_el.get_text(strip=True),
-                price=price,
-                location="",
-                url=href if href.startswith("http") else f"https://www.cdiscount.com{href}",
-                thumbnail=img_el.get("src", "") if img_el else "",
-            ))
+        html = fetch_rendered_html(url, wait_selector="a[href]")
+        listings = extract_generic_listings(html, "https://www.cdiscount.com", "Cdiscount")
         status["Cdiscount"] = f"OK — {len(listings)} annonce(s)"
     except Exception as e:
         status["Cdiscount"] = f"Échec ({e})"
